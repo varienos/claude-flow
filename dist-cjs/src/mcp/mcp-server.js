@@ -26,6 +26,23 @@ await import('./implementations/workflow-tools.js').catch(()=>{
 });
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+function safeJsonParse(value) {
+    if (value === null || value === undefined) {
+        return null;
+    }
+    if (typeof value === 'object') {
+        return value;
+    }
+    if (typeof value === 'string') {
+        try {
+            return JSON.parse(value);
+        } catch (e) {
+            console.error(`[${new Date().toISOString()}] WARN [claude-flow-mcp] Failed to parse JSON: ${e.message}`);
+            return null;
+        }
+    }
+    return value;
+}
 const LEGACY_AGENT_MAPPING = {
     analyst: 'code-analyzer',
     coordinator: 'task-orchestrator',
@@ -2015,7 +2032,7 @@ let ClaudeFlowMCPServer = class ClaudeFlowMCPServer {
                         const existingStats = await this.memoryStore.retrieve(statsKey, {
                             namespace: 'pattern-stats'
                         });
-                        let stats = existingStats ? JSON.parse(existingStats) : {
+                        let stats = existingStats ? safeJsonParse(existingStats) : {
                             pattern_type: args.pattern_type || 'coordination',
                             total_trainings: 0,
                             avg_accuracy: 0,
@@ -2063,8 +2080,22 @@ let ClaudeFlowMCPServer = class ClaudeFlowMCPServer {
                 try {
                     switch(args.action){
                         case 'analyze':
-                            if (args.metadata && args.metadata.modelId) {
-                                const patternValue = await this.memoryStore.retrieve(args.metadata.modelId, {
+                            let analyzeMetadata = {};
+                            if (args.metadata) {
+                                if (typeof args.metadata === 'string') {
+                                    try {
+                                        analyzeMetadata = JSON.parse(args.metadata);
+                                    } catch (e) {
+                                        analyzeMetadata = {
+                                            modelId: args.metadata
+                                        };
+                                    }
+                                } else if (typeof args.metadata === 'object') {
+                                    analyzeMetadata = args.metadata;
+                                }
+                            }
+                            if (analyzeMetadata.modelId) {
+                                const patternValue = await this.memoryStore.retrieve(analyzeMetadata.modelId, {
                                     namespace: 'patterns'
                                 });
                                 if (!patternValue) {
@@ -2072,11 +2103,20 @@ let ClaudeFlowMCPServer = class ClaudeFlowMCPServer {
                                         success: false,
                                         action: 'analyze',
                                         error: 'Pattern not found',
-                                        modelId: args.metadata.modelId,
+                                        modelId: analyzeMetadata.modelId,
                                         timestamp: new Date().toISOString()
                                     };
                                 }
-                                const pattern = JSON.parse(patternValue);
+                                const pattern = safeJsonParse(patternValue);
+                                if (!pattern) {
+                                    return {
+                                        success: false,
+                                        action: 'analyze',
+                                        error: 'Failed to parse pattern data',
+                                        modelId: analyzeMetadata.modelId,
+                                        timestamp: new Date().toISOString()
+                                    };
+                                }
                                 return {
                                     success: true,
                                     action: 'analyze',
@@ -2102,16 +2142,28 @@ let ClaudeFlowMCPServer = class ClaudeFlowMCPServer {
                                     total_patterns: allPatterns.length,
                                     patterns: allPatterns.map((p)=>{
                                         try {
-                                            const data = JSON.parse(p.value);
+                                            let data;
+                                            if (typeof p.value === 'string') {
+                                                data = JSON.parse(p.value);
+                                            } else if (typeof p.value === 'object' && p.value !== null) {
+                                                data = p.value;
+                                            } else {
+                                                return {
+                                                    error: 'Invalid pattern data format',
+                                                    key: p.key
+                                                };
+                                            }
                                             return {
-                                                modelId: data.modelId,
-                                                pattern_type: data.pattern_type,
-                                                accuracy: data.accuracy,
-                                                timestamp: data.timestamp
+                                                modelId: data.modelId || p.key,
+                                                pattern_type: data.pattern_type || 'unknown',
+                                                accuracy: data.accuracy || 0,
+                                                timestamp: data.timestamp || new Date().toISOString()
                                             };
                                         } catch (e) {
                                             return {
-                                                error: 'Failed to parse pattern data'
+                                                error: 'Failed to parse pattern data',
+                                                key: p.key,
+                                                details: e.message
                                             };
                                         }
                                     }),
@@ -2153,7 +2205,21 @@ let ClaudeFlowMCPServer = class ClaudeFlowMCPServer {
                                 timestamp: new Date().toISOString()
                             };
                         case 'predict':
-                            const patternType = args.metadata && args.metadata.pattern_type || 'coordination';
+                            let predictMetadata = {};
+                            if (args.metadata) {
+                                if (typeof args.metadata === 'string') {
+                                    try {
+                                        predictMetadata = JSON.parse(args.metadata);
+                                    } catch (e) {
+                                        predictMetadata = {
+                                            pattern_type: args.metadata
+                                        };
+                                    }
+                                } else if (typeof args.metadata === 'object') {
+                                    predictMetadata = args.metadata;
+                                }
+                            }
+                            const patternType = predictMetadata.pattern_type || args.operation || 'coordination';
                             const statsKey = `stats_${patternType}`;
                             const statsValue = await this.memoryStore.retrieve(statsKey, {
                                 namespace: 'pattern-stats'
@@ -2170,7 +2236,16 @@ let ClaudeFlowMCPServer = class ClaudeFlowMCPServer {
                                     timestamp: new Date().toISOString()
                                 };
                             }
-                            const stats = JSON.parse(statsValue);
+                            const stats = safeJsonParse(statsValue);
+                            if (!stats) {
+                                return {
+                                    success: false,
+                                    action: 'predict',
+                                    error: 'Failed to parse statistics data',
+                                    pattern_type: patternType,
+                                    timestamp: new Date().toISOString()
+                                };
+                            }
                             return {
                                 success: true,
                                 action: 'predict',
@@ -2185,7 +2260,21 @@ let ClaudeFlowMCPServer = class ClaudeFlowMCPServer {
                                 timestamp: new Date().toISOString()
                             };
                         case 'stats':
-                            const requestedType = args.metadata && args.metadata.pattern_type || null;
+                            let statsMetadata = {};
+                            if (args.metadata) {
+                                if (typeof args.metadata === 'string') {
+                                    try {
+                                        statsMetadata = JSON.parse(args.metadata);
+                                    } catch (e) {
+                                        statsMetadata = {
+                                            pattern_type: args.metadata
+                                        };
+                                    }
+                                } else if (typeof args.metadata === 'object') {
+                                    statsMetadata = args.metadata;
+                                }
+                            }
+                            const requestedType = statsMetadata.pattern_type || args.operation || null;
                             if (requestedType) {
                                 const statsKey = `stats_${requestedType}`;
                                 const statsValue = await this.memoryStore.retrieve(statsKey, {
@@ -2203,7 +2292,16 @@ let ClaudeFlowMCPServer = class ClaudeFlowMCPServer {
                                         timestamp: new Date().toISOString()
                                     };
                                 }
-                                const stats = JSON.parse(statsValue);
+                                const stats = safeJsonParse(statsValue);
+                                if (!stats) {
+                                    return {
+                                        success: false,
+                                        action: 'stats',
+                                        error: 'Failed to parse statistics data',
+                                        pattern_type: requestedType,
+                                        timestamp: new Date().toISOString()
+                                    };
+                                }
                                 return {
                                     success: true,
                                     action: 'stats',
@@ -2222,6 +2320,9 @@ let ClaudeFlowMCPServer = class ClaudeFlowMCPServer {
                                     total_pattern_types: allStats.length,
                                     statistics: allStats.map((s)=>{
                                         try {
+                                            if (typeof s.value === 'object' && s.value !== null) {
+                                                return s.value;
+                                            }
                                             return JSON.parse(s.value);
                                         } catch (e) {
                                             return {

@@ -46,6 +46,30 @@ await import('./implementations/workflow-tools.js').catch(() => {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+/**
+ * Safely parse value that might already be an object or a JSON string
+ * This handles the case where memoryStore.retrieve() returns deserialized objects
+ * @param {string|object} value - The value to parse
+ * @returns {object} - The parsed object
+ */
+function safeJsonParse(value) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  if (typeof value === 'object') {
+    return value; // Already an object, no need to parse
+  }
+  if (typeof value === 'string') {
+    try {
+      return JSON.parse(value);
+    } catch (e) {
+      console.error(`[${new Date().toISOString()}] WARN [claude-flow-mcp] Failed to parse JSON: ${e.message}`);
+      return null;
+    }
+  }
+  return value;
+}
+
 // Legacy agent type mapping for backward compatibility
 const LEGACY_AGENT_MAPPING = {
   analyst: 'code-analyzer',
@@ -1343,7 +1367,7 @@ class ClaudeFlowMCPServer {
               namespace: 'pattern-stats',
             });
 
-            let stats = existingStats ? JSON.parse(existingStats) : {
+            let stats = existingStats ? safeJsonParse(existingStats) : {
               pattern_type: args.pattern_type || 'coordination',
               total_trainings: 0,
               avg_accuracy: 0,
@@ -1404,8 +1428,22 @@ class ClaudeFlowMCPServer {
           switch (args.action) {
             case 'analyze':
               // Retrieve and analyze a specific pattern or all patterns
-              if (args.metadata && args.metadata.modelId) {
-                const patternValue = await this.memoryStore.retrieve(args.metadata.modelId, {
+              // Handle metadata - could be string, object, or undefined
+              let analyzeMetadata = {};
+              if (args.metadata) {
+                if (typeof args.metadata === 'string') {
+                  try {
+                    analyzeMetadata = JSON.parse(args.metadata);
+                  } catch (e) {
+                    analyzeMetadata = { modelId: args.metadata };
+                  }
+                } else if (typeof args.metadata === 'object') {
+                  analyzeMetadata = args.metadata;
+                }
+              }
+
+              if (analyzeMetadata.modelId) {
+                const patternValue = await this.memoryStore.retrieve(analyzeMetadata.modelId, {
                   namespace: 'patterns',
                 });
 
@@ -1414,12 +1452,21 @@ class ClaudeFlowMCPServer {
                     success: false,
                     action: 'analyze',
                     error: 'Pattern not found',
-                    modelId: args.metadata.modelId,
+                    modelId: analyzeMetadata.modelId,
                     timestamp: new Date().toISOString(),
                   };
                 }
 
-                const pattern = JSON.parse(patternValue);
+                const pattern = safeJsonParse(patternValue);
+                if (!pattern) {
+                  return {
+                    success: false,
+                    action: 'analyze',
+                    error: 'Failed to parse pattern data',
+                    modelId: analyzeMetadata.modelId,
+                    timestamp: new Date().toISOString(),
+                  };
+                }
                 return {
                   success: true,
                   action: 'analyze',
@@ -1447,15 +1494,23 @@ class ClaudeFlowMCPServer {
                   total_patterns: allPatterns.length,
                   patterns: allPatterns.map((p) => {
                     try {
-                      const data = JSON.parse(p.value);
+                      // Handle both string and object values
+                      let data;
+                      if (typeof p.value === 'string') {
+                        data = JSON.parse(p.value);
+                      } else if (typeof p.value === 'object' && p.value !== null) {
+                        data = p.value;
+                      } else {
+                        return { error: 'Invalid pattern data format', key: p.key };
+                      }
                       return {
-                        modelId: data.modelId,
-                        pattern_type: data.pattern_type,
-                        accuracy: data.accuracy,
-                        timestamp: data.timestamp,
+                        modelId: data.modelId || p.key,
+                        pattern_type: data.pattern_type || 'unknown',
+                        accuracy: data.accuracy || 0,
+                        timestamp: data.timestamp || new Date().toISOString(),
                       };
                     } catch (e) {
-                      return { error: 'Failed to parse pattern data' };
+                      return { error: 'Failed to parse pattern data', key: p.key, details: e.message };
                     }
                   }),
                   timestamp: new Date().toISOString(),
@@ -1503,7 +1558,21 @@ class ClaudeFlowMCPServer {
 
             case 'predict':
               // Predict based on stored patterns
-              const patternType = (args.metadata && args.metadata.pattern_type) || 'coordination';
+              // Handle metadata - could be string, object, or undefined
+              let predictMetadata = {};
+              if (args.metadata) {
+                if (typeof args.metadata === 'string') {
+                  try {
+                    predictMetadata = JSON.parse(args.metadata);
+                  } catch (e) {
+                    // If string but not JSON, treat as pattern_type
+                    predictMetadata = { pattern_type: args.metadata };
+                  }
+                } else if (typeof args.metadata === 'object') {
+                  predictMetadata = args.metadata;
+                }
+              }
+              const patternType = predictMetadata.pattern_type || args.operation || 'coordination';
               const statsKey = `stats_${patternType}`;
               const statsValue = await this.memoryStore.retrieve(statsKey, {
                 namespace: 'pattern-stats',
@@ -1522,7 +1591,16 @@ class ClaudeFlowMCPServer {
                 };
               }
 
-              const stats = JSON.parse(statsValue);
+              const stats = safeJsonParse(statsValue);
+              if (!stats) {
+                return {
+                  success: false,
+                  action: 'predict',
+                  error: 'Failed to parse statistics data',
+                  pattern_type: patternType,
+                  timestamp: new Date().toISOString(),
+                };
+              }
               return {
                 success: true,
                 action: 'predict',
@@ -1544,7 +1622,20 @@ class ClaudeFlowMCPServer {
 
             case 'stats':
               // Return statistics for all pattern types or specific type
-              const requestedType = (args.metadata && args.metadata.pattern_type) || null;
+              // Handle metadata - could be string, object, or undefined
+              let statsMetadata = {};
+              if (args.metadata) {
+                if (typeof args.metadata === 'string') {
+                  try {
+                    statsMetadata = JSON.parse(args.metadata);
+                  } catch (e) {
+                    statsMetadata = { pattern_type: args.metadata };
+                  }
+                } else if (typeof args.metadata === 'object') {
+                  statsMetadata = args.metadata;
+                }
+              }
+              const requestedType = statsMetadata.pattern_type || args.operation || null;
 
               if (requestedType) {
                 const statsKey = `stats_${requestedType}`;
@@ -1565,7 +1656,16 @@ class ClaudeFlowMCPServer {
                   };
                 }
 
-                const stats = JSON.parse(statsValue);
+                const stats = safeJsonParse(statsValue);
+                if (!stats) {
+                  return {
+                    success: false,
+                    action: 'stats',
+                    error: 'Failed to parse statistics data',
+                    pattern_type: requestedType,
+                    timestamp: new Date().toISOString(),
+                  };
+                }
                 return {
                   success: true,
                   action: 'stats',
@@ -1586,6 +1686,10 @@ class ClaudeFlowMCPServer {
                   total_pattern_types: allStats.length,
                   statistics: allStats.map((s) => {
                     try {
+                      // Handle both string and object values from list()
+                      if (typeof s.value === 'object' && s.value !== null) {
+                        return s.value;
+                      }
                       return JSON.parse(s.value);
                     } catch (e) {
                       return { error: 'Failed to parse stats data' };
